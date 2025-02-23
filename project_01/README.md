@@ -1,1 +1,1 @@
-# Smart Life Therapy Device
+# Smart Light Therapy Device
