@@ -1,9 +1,9 @@
 """
 --------------------------------------------------------------------------
-Button Driver
+Threaded Button Driver
 --------------------------------------------------------------------------
 License:   
-Copyright 2021-2025 - Sophianne Loh
+Copyright 2023 - 2025 - Sophianne Loh
 
 Redistribution and use in source and binary forms, with or without 
 modification, are permitted provided that the following conditions are met:
@@ -31,7 +31,9 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 --------------------------------------------------------------------------
 
-Button Driver
+Threaded Button Driver
+
+  This driver provides a button that runs in its own execution thread.
 
   This driver can support buttons that have either a pull up resistor between the
 button and the processor pin (i.e. the input is "High" / "1" when the button is
@@ -41,20 +43,27 @@ between the button and the processor pin (i.e. the input is "Low" / "0" when the
 button is not pressed) and will be connected to power when the button is pressed
 (i.e. the input is "High" / "1" when the button is pressed).
 
-  To select the pull up configuration, press_low=True.  To select the pull down
-configuration, press_low=False.
+  To select the pull up configuration, active_low=True.  To select the pull down
+configuration, active_low=False.
+  
 
-
+  
 Software API:
 
-  Button(pin, press_low, sleep_time)
+  ThreadedButton(pin, sleep_time=0.1, active_low=True)
     - Provide pin that the button monitors
-    - Sleep time prevents CPU from being overloaded
+    - The sleep_time is the time between calls to the callback functions
+      while the button is waiting in either the pressed or unpressed state
+    - By default, the button is "active_low" (i.e. the button has a 
+      pull up resistor between the button and the processor pin and 
+      will be connected to ground when the button is pressed.  The 
+      input is "High"/"1" when the button is not pressed, and the 
+      input is "Low" / "0" when the button is pressed).  If false, 
+      the button has the opposite polarity.
     
-    wait_for_press()
-      - Wait for the button to be pressed 
-      - Function consumes time - matters for embedded hardware
-        
+    start()
+      - Starts the button thread
+    
     is_pressed()
       - Return a boolean value (i.e. True/False) on if button is pressed
       - Function consumes no time
@@ -63,20 +72,17 @@ Software API:
       - Return the duration the button was last pressed
 
     cleanup()
-      - Clean up HW (very important for motors, anything with sound)
+      - Stops the button so thread can exit
       
     Callback Functions:
       These functions will be called at the various times during a button 
       press cycle.  There is also a corresponding function to get the value
-      from each of these callback functions in case they return something. 
-      (Called as part of another function that consumes time)
-      For example, while button is unpressed, can run a callback function to 
-      display time, etc.
+      from each of these callback functions in case they return something.
     
       - set_pressed_callback(function)
-        - Executed every "sleep_time" while the button is pressed
+        - Excuted every "sleep_time" while the button is pressed
       - set_unpressed_callback(function)
-        - Executed every "sleep_time" while the button is unpressed
+        - Excuted every "sleep_time" while the button is unpressed
       - set_on_press_callback(function)
         - Executed once when the button is pressed
       - set_on_release_callback(function)
@@ -87,9 +93,9 @@ Software API:
       - get_on_press_callback_value()
       - get_on_release_callback_value()      
 
-
 """
 import time
+import threading
 
 import Adafruit_BBIO.GPIO as GPIO
 
@@ -97,7 +103,7 @@ import Adafruit_BBIO.GPIO as GPIO
 # Constants
 # ------------------------------------------------------------------------
 
-HIGH          = GPIO.HIGH # redefine so that we can change high/low here if needed
+HIGH          = GPIO.HIGH
 LOW           = GPIO.LOW
 
 # ------------------------------------------------------------------------
@@ -110,16 +116,17 @@ LOW           = GPIO.LOW
 # Functions / Classes
 # ------------------------------------------------------------------------
 
-class Button():
-    """ Button Class """
+class ThreadedButton(threading.Thread):
+    """ Threaded Button Class """
     pin                           = None
-    
-    unpressed_value               = None # depends on button orientation
-    pressed_value                 = None #^
-    
+
+    unpressed_value               = None
+    pressed_value                 = None
+
     sleep_time                    = None
+    stop_button                   = None
     press_duration                = None
-    # four callback functions, four callback values
+
     pressed_callback              = None
     pressed_callback_value        = None
     unpressed_callback            = None
@@ -129,27 +136,32 @@ class Button():
     on_release_callback           = None
     on_release_callback_value     = None
     
-    
-    def __init__(self, pin=None, press_low=True, sleep_time=0.1):
+    def __init__(self, pin=None, sleep_time=0.1, active_low=True):
         """ Initialize variables and set up the button """
-        if (pin == None): # None is a value that means nothing is assigned
+        # Call parent class constructor
+        threading.Thread.__init__(self)        
+        # Initialize variables and set up the button
+        if (pin == None):
             raise ValueError("Pin not provided for Button()")
         else:
             self.pin = pin
-        
-        # For pull up resistor configuration:    press_low = True
-        # For pull down resistor configuration:  press_low = False
-        if press_low:
+
+        # For pull up resistor configuration:    active_low = True
+        # For pull down resistor configuration:  active_low = False
+        if active_low:
             self.unpressed_value = HIGH
             self.pressed_value   = LOW
         else:
             self.unpressed_value = LOW
             self.pressed_value   = HIGH
-        
-        # By default sleep time is "0.1" seconds
-        self.sleep_time      = sleep_time
-        self.press_duration  = 0.0        
 
+        # Initialize Class Variables      
+        self.sleep_time      = sleep_time
+        self.stop_button     = False
+        self.press_duration  = 0.0
+
+        # All callback functions and values set to None if not used        
+        
         # Initialize the hardware components        
         self._setup()
     
@@ -159,8 +171,6 @@ class Button():
     def _setup(self):
         """ Setup the hardware components. """
         # Initialize Button
-        # HW#4 TODO: (one line of code)
-        #   Remove "pass" and use the Adafruit_BBIO.GPIO library to set up the button
         GPIO.setup(self.pin, GPIO.IN)
 
     # End def
@@ -172,73 +182,61 @@ class Button():
            Returns:  True  - Button is pressed
                      False - Button is not pressed
         """
-        # HW#4 TODO: (one line of code)
-        #   Remove "pass" and return the comparison of input value of the GPIO pin of 
-        #   the buton (i.e. self.pin) to the "pressed value" of the class 
-        return GPIO.input(self.pin) == self.pressed_value # reference instance of this button
+        return GPIO.input(self.pin) == self.pressed_value
 
     # End def
 
 
-    def wait_for_press(self):
-        """ Wait for the button to be pressed.  This function will 
-           wait for the button to be pressed and released so there
-           are no race conditions.
-           
-           Use the callback functions to peform actions while waiting
-           for the button to be pressed or get values after the button
-           is pressed.
-        
-           Arguments:  None
-           Returns:    None
-        """
-        button_press_time = None
-        
-        # Wait for button press
-        #   Execute the unpressed callback function based on the sleep time
-        #
-        # HW#4 TODO: (one line of code)
-        #   Update while loop condition to compare the input value of the  
-        #   GPIO pin of the buton (i.e. self.pin) to the "unpressed value" 
-        #   of the class (i.e. we are executing the while loop while the 
-        #   button is not being pressed)
-        #
-        while GPIO.input(self.pin) == self.unpressed_value: # only execute when not pressed
-        
-            if self.unpressed_callback is not None: # if we have something to do in the callback function
-                self.unpressed_callback_value = self.unpressed_callback()
-            
-            time.sleep(self.sleep_time) # delay to prevent overconsumption of CPU
-            
-        # Record time
-        button_press_time = time.time() # record time when button is pressed
-        
-        # Executed the on press callback function
-        if self.on_press_callback is not None: # if we have something to do in the callback function
-            self.on_press_callback_value = self.on_press_callback()
-        
-        # Wait for button release
-        #   Execute the pressed callback function based on the sleep time
-        #
-        # HW#4 TODO: (one line of code)
-        #   Update while loop condition to compare the input value of the  
-        #   GPIO pin of the buton (i.e. self.pin) to the "pressed value" 
-        #   of the class (i.e. we are executing the while loop while the 
-        #   button is being pressed)
-        #
-        while GPIO.input(self.pin) == self.pressed_value: # what to do when button is pressed
-        
-            if self.pressed_callback is not None:
-                self.pressed_callback_value = self.pressed_callback()
-                
-            time.sleep(self.sleep_time)
-        
-        # Record the press duration
-        self.press_duration = time.time() - button_press_time
+    def run(self):
+        """ Run the button thread.  Execute callbacks as appropriate. """
+        button_press_time     = None
 
-        # Execute the on release callback function
-        if self.on_release_callback is not None: 
-            self.on_release_callback_value = self.on_release_callback()        
+        # Run button monitor until told to stop        
+        while(self.stop_button == False): 
+        
+            # Wait for button press
+            #   Execute the unpressed callback function based on the sleep time
+            #
+            while(GPIO.input(self.pin) == self.unpressed_value):
+            
+                if self.unpressed_callback is not None:
+                    self.unpressed_callback_value = self.unpressed_callback()
+                
+                if self.stop_button:
+                    break
+                
+                time.sleep(self.sleep_time)
+            
+            # Record time
+            button_press_time = time.time()
+            
+            # Executed the on press callback function
+            if self.on_press_callback is not None:
+                self.on_press_callback_value = self.on_press_callback()
+            
+            # Wait for button release
+            #   Execute the pressed callback function based on the sleep time
+            #
+            while(GPIO.input(self.pin) == self.pressed_value):
+            
+                if self.pressed_callback is not None:
+                    self.pressed_callback_value = self.pressed_callback()
+                    
+                if self.stop_button:
+                    break
+                    
+                time.sleep(self.sleep_time)
+            
+            # Record the press duration
+            self.press_duration = time.time() - button_press_time
+
+            # Executed the on release callback function
+            if self.on_release_callback is not None:
+                self.on_release_callback_value = self.on_release_callback()        
+        
+        # Set the flag and press duration to allow the button thread to restart
+        self.stop_button    = False
+        self.press_duration = 0.0
         
     # End def
 
@@ -252,8 +250,11 @@ class Button():
     
     def cleanup(self):
         """ Clean up the button hardware. """
-        # Nothing to do for GPIO
-        pass
+        # Nothing to do for GPIO; stop the thread and wait for completion
+        self.stop_button = True
+
+        while (self.stop_button):
+            time.sleep(self.sleep_time)
     
     # End def
     
@@ -318,69 +319,84 @@ class Button():
 # Main script
 # ------------------------------------------------------------------------
 
-if __name__ == '__main__': # only gets executed when run from command line
-
-    print("Button Test")
-
-    # Create instantiation of the button
-    button = Button("P2_2")
+if __name__ == '__main__':
+    """ This test requires the use of two LEDs as well as two buttons.
     
-    # Create functions to test the callback functions
-    def pressed():
-        print("  Button pressed")
-    # End def
+    In this test there are two threaded buttons running in parallel.  Each
+    button controls an LED.  When the button is pressed, the corresponding 
+    LED will turn on and when the button is released, the LED will turn off.
+    """
+    import sys
+
+    # Update path to correct directory for LED class     
+    sys.path.append("/var/lib/cloud9/EDES301/python/led")
     
-    def unpressed():
-        print("  Button not pressed")
-    # End def
+    print("Threaded Button Test")
 
-    def on_press():
-        print("  On Button press")
-        return 3
-    # End def
+    # Create instantiation of the buttons and LEDs
+    button_0 = ThreadedButton("P2_2")
+    button_1 = ThreadedButton("P2_8")
 
-    def on_release():
-        print("  On Button release")
-        return 4
-    # End def    
+    try:
+        # Set up the LEDs
+        import led as LED
+        
+        led_0    = LED.LED("P2_4")
+        led_1    = LED.LED("P2_6")
 
+        # Set up the button callbacks
+        button_0.set_on_press_callback(led_0.on)
+        button_0.set_on_release_callback(led_0.off)
+        
+        button_1.set_on_press_callback(led_1.on)
+        button_1.set_on_release_callback(led_1.off)
+        
+    except:
+        # LEDs not available, use print statements instead
+        def led_0_on():
+            print("LED 0: ON")
+        def led_0_off():
+            print("LED 0: OFF")
+        def led_1_on():
+            print("LED 1: ON")
+        def led_1_off():
+            print("LED 1: OFF")
+            
+        # Set up the button callbacks
+        button_0.set_on_press_callback(led_0_on)
+        button_0.set_on_release_callback(led_0_off)
+        
+        button_1.set_on_press_callback(led_1_on)
+        button_1.set_on_release_callback(led_1_off)
+    
+    # Start the buttons
+    button_0.start()
+    button_1.start()
+    
+    # Get the main thread
+    main_thread = threading.currentThread()
+    
     # Use a Keyboard Interrupt (i.e. "Ctrl-C") to exit the test
     try:
-        # Check if the button is pressed
-        print("Is the button pressed?")
-        print("    {0}".format(button.is_pressed()))
-
-        print("Press and hold the button.")
-        time.sleep(4)
-        
-        # Check if the button is pressed
-        print("Is the button pressed?")
-        print("    {0}".format(button.is_pressed()))
-        
-        print("Release the button.")
-        time.sleep(4)
-        
-        print("Waiting for button press ...")
-        button.wait_for_press()
-        print("    Button pressed for {0} seconds. ".format(button.get_last_press_duration()))        
-        time.sleep(4)
-
-        print("Setting callback functions ... ")
-        button.set_pressed_callback(pressed)
-        button.set_unpressed_callback(unpressed)
-        button.set_on_press_callback(on_press)
-        button.set_on_release_callback(on_release)
-        
-        print("Waiting for button press with callback functions ...")
-        value = button.wait_for_press()
-        print("    Button pressed for {0} seconds. ".format(button.get_last_press_duration()))
-        print("    Button pressed callback return value    = {0} ".format(button.get_pressed_callback_value()))
-        print("    Button unpressed callback return value  = {0} ".format(button.get_unpressed_callback_value()))
-        print("    Button on press callback return value   = {0} ".format(button.get_on_press_callback_value()))
-        print("    Button on release callback return value = {0} ".format(button.get_on_release_callback_value()))        
+        while (True):
+            # Do nothing in the main thread
+            time.sleep(1)
         
     except KeyboardInterrupt:
-        pass
+        # Clean up the hardware
+        button_0.cleanup()
+        button_1.cleanup()
+
+        try:
+            led_0.cleanup()
+            led_1.cleanup()
+        except:
+            pass
+
+    # Wait for threads to complete        
+    for t in threading.enumerate():
+        if t is not main_thread:
+            t.join()
 
     print("Test Complete")
 
